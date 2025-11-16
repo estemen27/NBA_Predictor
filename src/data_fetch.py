@@ -1,115 +1,198 @@
-from nba_api.stats.endpoints import leaguegamelog
 import pandas as pd
+from nba_api.stats.endpoints import LeagueGameLog
 
-
-
-from nba_api.stats.endpoints import leaguegamelog
-import pandas as pd
+# Parámetros por defecto de la temporada actual
+DEFAULT_SEASON = "2025-26"
+DEFAULT_SEASON_TYPE = "Regular Season"
 
 
 def get_current_season_team_logs(
-    season: str = "2025-26",
-    season_type: str = "Regular Season"
+    season: str = DEFAULT_SEASON,
+    season_type: str = DEFAULT_SEASON_TYPE,
 ) -> pd.DataFrame:
     """
-    Descarga el game log de TODOS los equipos para una temporada y tipo de temporada,
-    usando LeagueGameLog como fuente.
+    Descarga los logs de PARTIDO a nivel EQUIPO usando la API oficial de la NBA
+    (nba_api) y devuelve un DataFrame con las columnas necesarias.
 
-    Devuelve un dataframe TEAM-GAME (1 fila = 1 equipo en 1 partido).
+    Cada fila = 1 equipo en 1 partido.
     """
-    logs = leaguegamelog.LeagueGameLog(
-        player_or_team_abbreviation="T",      # T = Team, P = Player
+    logs = LeagueGameLog(
         season=season,
-        season_type_all_star=season_type     # 'Regular Season', 'Playoffs', etc.
+        season_type_all_star=season_type,
+        player_or_team_abbreviation="T",  # 'T' = team
     )
 
-    df = logs.get_data_frames()[0]
+    df = logs.get_data_frames()[0].copy()
+
+    # Estandarizamos la fecha
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
-    df = df.sort_values(["GAME_DATE", "GAME_ID", "TEAM_ID"]).reset_index(drop=True)
+
+    # Nos quedamos solo con las columnas que vamos a usar
+    cols = [
+        "SEASON_ID",
+        "TEAM_ID",
+        "TEAM_ABBREVIATION",
+        "TEAM_NAME",
+        "GAME_ID",
+        "GAME_DATE",
+        "MATCHUP",
+        "WL",
+        "PTS",
+        "FGA",
+        "FTA",
+        "OREB",
+        "TOV",
+    ]
+    df = df[cols].copy()
+
     return df
 
 
-
-
-
-def build_game_level_dataset(df_team_logs: pd.DataFrame,
-                             max_games: int | None = None) -> pd.DataFrame:
+def build_team_level_dataset(df_logs: pd.DataFrame) -> pd.DataFrame:
     """
-    A partir de logs por equipo (TEAM-GAME) construye un dataset a nivel partido (GAME),
-    con info de local y visitante en una sola fila.
-
-    Si max_games no es None, devuelve solo los primeros max_games partidos
-    por orden cronológico.
+    A partir de los logs de la API construye un dataset a nivel EQUIPO-PARTIDO,
+    con:
+      - IS_HOME
+      - POINTS_FOR / POINTS_AGAINST
+      - MARGIN
+      - WIN
+      - columnas de tiro (FGA, FTA, OREB, TOV)
     """
-    df = df_team_logs.copy()
+    df = df_logs.copy()
 
-    # Flag local/visitante basado en MATCHUP (" vs. " = local, " @ " = visita)
-    df["IS_HOME"] = df["MATCHUP"].str.contains(" vs. ")
+    # Orden por equipo y fecha
+    df = df.sort_values(["TEAM_ID", "GAME_DATE"]).reset_index(drop=True)
 
-    # Separar home y away
-    df_home = df[df["IS_HOME"]].copy()
-    df_away = df[~df["IS_HOME"]].copy()
+    # Flag local/visitante: en MATCHUP 'vs.' = local, '@' = visitante
+    df["IS_HOME"] = df["MATCHUP"].str.contains(" vs. ").astype(int)
 
-    # Renombrar columnas para HOME
-    df_home = df_home.rename(columns={
-        "TEAM_ID": "HOME_TEAM_ID",
-        "TEAM_NAME": "HOME_TEAM_NAME",
-        "TEAM_ABBREVIATION": "HOME_TEAM_ABBR",
-        "PTS": "HOME_PTS",
-    })
+    # Puntos a favor
+    df["POINTS_FOR"] = df["PTS"]
 
-    # Renombrar columnas para AWAY
-    df_away = df_away.rename(columns={
-        "TEAM_ID": "AWAY_TEAM_ID",
-        "TEAM_NAME": "AWAY_TEAM_NAME",
-        "TEAM_ABBREVIATION": "AWAY_TEAM_ABBR",
-        "PTS": "AWAY_PTS",
-    })
+    # Puntos en contra: hacemos un self-merge por GAME_ID
+    opp = df[["GAME_ID", "TEAM_ID", "POINTS_FOR"]].rename(
+        columns={
+            "TEAM_ID": "OPP_TEAM_ID",
+            "POINTS_FOR": "OPP_POINTS_FOR",
+        }
+    )
 
-    # Seleccionar solo columnas necesarias (OJO: sin SEASON_YEAR)
-    df_home = df_home[[
-        "GAME_ID", "GAME_DATE",
-        "HOME_TEAM_ID", "HOME_TEAM_NAME", "HOME_TEAM_ABBR",
-        "HOME_PTS"
-    ]]
+    df = df.merge(opp, on="GAME_ID")
+    df = df[df["TEAM_ID"] != df["OPP_TEAM_ID"]].copy()
 
-    df_away = df_away[[
+    # Nos quedamos con una fila por TEAM_ID-GAME_ID
+    df.drop(columns=["OPP_TEAM_ID"], inplace=True)
+    df["POINTS_AGAINST"] = df["OPP_POINTS_FOR"]
+    df.drop(columns=["OPP_POINTS_FOR"], inplace=True)
+
+    # Margen y victoria
+    df["MARGIN"] = df["POINTS_FOR"] - df["POINTS_AGAINST"]
+    df["WIN"] = (df["MARGIN"] > 0).astype(int)
+
+    # Dejamos columnas ordenadas
+    ordered_cols = [
         "GAME_ID",
-        "AWAY_TEAM_ID", "AWAY_TEAM_NAME", "AWAY_TEAM_ABBR",
-        "AWAY_PTS"
-    ]]
+        "GAME_DATE",
+        "TEAM_ID",
+        "TEAM_ABBREVIATION",
+        "TEAM_NAME",
+        "IS_HOME",
+        "POINTS_FOR",
+        "POINTS_AGAINST",
+        "WIN",
+        "MARGIN",
+        "FGA",
+        "FTA",
+        "OREB",
+        "TOV",
+        "MATCHUP",
+        "SEASON_ID",
+    ]
+    df = df[ordered_cols].copy()
 
-    # Merge para obtener una fila por partido
-    df_games = df_home.merge(df_away, on="GAME_ID", how="inner")
+    return df
 
-    # Targets básicos
-    df_games["MARGIN_HOME"] = df_games["HOME_PTS"] - df_games["AWAY_PTS"]
-    df_games["HOME_WIN"] = (df_games["MARGIN_HOME"] > 0).astype(int)
 
-    # Ordenar por fecha y limitar número de partidos
-    df_games = df_games.sort_values(["GAME_DATE", "GAME_ID"])
+def build_game_level_dataset(
+    df_team: pd.DataFrame,
+    max_games: int | None = None,
+) -> pd.DataFrame:
+    """
+    Construye un dataset a nivel PARTIDO (una fila por GAME_ID) con info
+    de equipo local y visitante (puntos, nombres, etc.).
+    """
+    df = df_team.copy()
+
+    # Opcional: limitar al primer N partidos de la temporada (por fecha)
     if max_games is not None:
-        df_games = df_games.head(max_games)
+        game_ids = (
+            df.sort_values("GAME_DATE")["GAME_ID"]
+            .drop_duplicates()
+            .iloc[:max_games]
+        )
+        df = df[df["GAME_ID"].isin(game_ids)]
 
-    df_games = df_games.reset_index(drop=True)
-    return df_games
+    # HOME
+    home = (
+        df[df["IS_HOME"] == 1]
+        .rename(
+            columns={
+                "TEAM_ID": "HOME_TEAM_ID",
+                "TEAM_ABBREVIATION": "HOME_TEAM_ABBR",
+                "TEAM_NAME": "HOME_TEAM_NAME",
+                "POINTS_FOR": "HOME_PTS",
+                "POINTS_AGAINST": "HOME_PA",
+                "MARGIN": "HOME_MARGIN",
+            }
+        )
+        [
+            [
+                "GAME_ID",
+                "GAME_DATE",
+                "HOME_TEAM_ID",
+                "HOME_TEAM_ABBR",
+                "HOME_TEAM_NAME",
+                "HOME_PTS",
+                "HOME_PA",
+                "HOME_MARGIN",
+            ]
+        ]
+    )
 
+    # AWAY
+    away = (
+        df[df["IS_HOME"] == 0]
+        .rename(
+            columns={
+                "TEAM_ID": "AWAY_TEAM_ID",
+                "TEAM_ABBREVIATION": "AWAY_TEAM_ABBR",
+                "TEAM_NAME": "AWAY_TEAM_NAME",
+                "POINTS_FOR": "AWAY_PTS",
+                "POINTS_AGAINST": "AWAY_PA",
+                "MARGIN": "AWAY_MARGIN",
+            }
+        )
+        [
+            [
+                "GAME_ID",
+                "AWAY_TEAM_ID",
+                "AWAY_TEAM_ABBR",
+                "AWAY_TEAM_NAME",
+                "AWAY_PTS",
+                "AWAY_PA",
+                "AWAY_MARGIN",
+            ]
+        ]
+    )
 
+    games = home.merge(away, on="GAME_ID")
 
-def get_current_season_games_lite(season: str = "2025-26",
-                                  season_type: str = "Regular Season",
-                                  max_games: int = 15) -> pd.DataFrame:
-    """
-    Función de alto nivel:
-    - Descarga logs de equipos
-    - Construye dataset a nivel partido
-    - Limita a los primeros max_games partidos
-    """
-    df_team_logs = get_current_season_team_logs(season, season_type)
-    df_games = build_game_level_dataset(df_team_logs, max_games=max_games)
-    return df_games
+    # Targets principales
+    games["HOME_WIN"] = (games["HOME_PTS"] > games["AWAY_PTS"]).astype(int)
+    games["MARGIN_HOME"] = games["HOME_PTS"] - games["AWAY_PTS"]
+    games["TOTAL_POINTS"] = games["HOME_PTS"] + games["AWAY_PTS"]
 
-if __name__ == "__main__":
-    df_test = get_current_season_team_logs()
-    print(df_test.head())
-    print("Partidos descargados:", len(df_test))
+    # Ordenamos cronológicamente
+    games = games.sort_values("GAME_DATE").reset_index(drop=True)
+
+    return games
